@@ -6,7 +6,6 @@
 
 My current understanding is that MoFA is structured as a microkernel-based Rust framework with a clear separation between layers.
 
-
 ![Figure 1: MoFA Layered Architecture Overview](figures/fig01-mofa-layered-architecture.png)
 
 *Figure 1: How MoFA is organized into layers. The Swarm Orchestrator will span kernel, foundation, and runtime, with public APIs surfaced through the SDK.*
@@ -22,7 +21,7 @@ Idea 5 describes the Cognitive Swarm Orchestrator as the brain of this ecosystem
 
 It connects with:
 
-- **Gateway** for capability access to tools, devices, and external APIs.
+- **Gateway** for capability access to tools, devices, and external APIs. In current MoFA this is already a major platform layer, including routing, rate control, observability hooks, and distributed control-plane concerns. Gateway is not a small add-on; it is a large-scale subsystem that the orchestrator treats as a first-class integration surface for reaching any external capability an agent might need.
 - **Smith / Observatory** for traces, metrics, and evaluation of swarm runs.
 - **SDK** for polyglot users to call into orchestrated swarms from other languages.
 
@@ -38,7 +37,7 @@ The idea text lists several named components that I plan to follow closely:
 - `HITLGovernor` for the human-in-the-loop lifecycle, including escalation.
 - A `GovernanceLayer` for SLAs, audits, and notifications.
 - A plugin marketplace core with dependency resolution and trust scoring.
-- A semantic agent discovery system built on an agent capability registry.
+- A semantic agent discovery system built on an agent capability registry, plus semantic agent generation when no suitable prebuilt agent exists.
 
 My plan is to put the core orchestration traits and types in the kernel where that makes sense, and to implement the main orchestrator logic and integration glue in foundation and runtime, so the Swarm Orchestrator fits naturally into the framework instead of sitting off to the side.
 
@@ -54,18 +53,17 @@ I will build the project in several phases that line up with the idea descriptio
 
 The goal here is to set up the minimal orchestrator core that can understand tasks and form teams of expert models.
 
-
 ![Figure 3: Task Decomposition and Agent Matching Flow](figures/fig03-task-decomposition-flow.png)
 
 *Figure 3: How a high-level task flows through TaskAnalyzer (decomposition into a DAG of subtasks with dependencies) and SwarmComposer (matching each subtask to the best expert model via capability lookup). This is the first step before any coordination pattern is applied.*
 
-Notice that in Figure 3, each subtask gets its own expert model. The Code Expert writes the patch, the Test Expert writes verification, and the Security Expert reviews for safety. This is the core value of the swarm approach: each model does what it is best at, instead of asking one general model to do everything.
+Notice that in Figure 3, each subtask gets its own expert model. The Code Expert writes the patch, the Test Expert writes verification, and the Security Expert reviews for safety. This is the core value of the swarm approach: each model does what it is best at, instead of asking one general model to do everything. We are using different models for what they are known to be best at.
 
 What I plan to do:
 
 - Define core orchestration types and traits like `TaskDescriptor`, `Subtask`, `SwarmPlan`, and `CoordinationPattern` in the right layer, most likely in a new `mofa-orchestrator` crate under the `mofa` repo. I will reuse existing kernel types wherever I can.
 - Build `TaskAnalyzer` as a component that takes a high-level task description (plus optional structured hints) and produces a DAG of subtasks with dependencies and rough difficulty ratings. For the first version, this can use a simple LLM prompt strategy and some basic rule-based checks, with the design leaving room for more advanced analyzers later.
-- Build `SwarmComposer` to map subtasks to agent roles and individual agents using an agent capability registry. The first version can use a straightforward matching strategy, like tagging agents with capabilities and using a basic scoring function, but the API should allow plugging in smarter matching later. Importantly, SwarmComposer also annotates each subtask with a recommended coordination pattern (see Phase 2 and Figure 6 for how patterns are combined).
+- Build `SwarmComposer` to map subtasks to agent roles and individual agents using an agent capability registry. The first version can use a straightforward matching strategy, like tagging agents with capabilities and using a basic scoring function, but the API should allow plugging in smarter matching later. Importantly, SwarmComposer also annotates each subtask with a recommended coordination pattern (see Phase 2 and Figure 5 for how patterns are combined).
 - Build a minimal in-memory representation and serialization format for swarm plans, so they can be logged, inspected, and passed to later components.
 
 From a MoFA perspective, this phase is mainly about designing the orchestrator API so it integrates cleanly with existing agent metadata and capability representations, and making the core components testable on their own with artificial agent definitions.
@@ -78,25 +76,55 @@ The goal is to support multiple collaboration modes, prove that multi-expert coo
 
 ###### Individual Patterns
 
+
 ![Figure 4: Coordination Patterns Comparison](figures/fig04-coordination-patterns.png)
 
-*Figure 4: Three coordination patterns the orchestrator can use. Sequential and Parallel are the MVP targets. Debate is also implemented with mocked experts to validate the multi-expert value proposition. Each pattern uses specialized expert models, not generic ones.*
+*Figure 4: Three coordination patterns the orchestrator can use. Sequential chains experts one after another. Parallel fans out independent multimodal subtasks (image, video, audio) simultaneously. Debate pits two experts against each other and resolves with a judge. Each pattern uses specialized expert models chosen for what they are best at.*
 
-Figure 4 shows each pattern in isolation. But in practice, the orchestrator does not pick just one pattern for the entire task. Different parts of the same task DAG call for different patterns. The next figure shows how they combine.
+Figure 4 shows each pattern in isolation. But in practice, the orchestrator does not pick just one pattern for the entire task. Different parts of the same task DAG call for different patterns. The next figure shows how they combine. Before that, the orchestrator first decides which mode the overall task needs.
+
+###### Dynamic Runtime Routing Before Pattern Selection
+
+Before pattern selection, the orchestrator applies a mode-routing policy. The big picture is that the whole process is dynamic. Not every task needs the same level of orchestration:
+
+- **Simple mode**: direct low-risk tasks with clear intent. Example: "What is the weather in New York?" This simply requires one expert model, direct execution, and a direct answer. No DAG, no debate.
+- **Complex mode**: multi-step tasks requiring DAG decomposition and mixed patterns. Example: "Fix a security bug, add tests, and ship a PR." This needs multiple expert models coordinated across sequential, parallel, and potentially debate stages.
+- **Debate mode (extra thinking)**: ambiguous or high-impact tasks where multiple expert views reduce blind spots. This is selective. It activates only when the uncertainty or stakes justify the overhead.
+
+If the user already provides a detailed spec document with clear constraints and acceptance criteria, Debate can be skipped entirely. The spec itself serves as the "extra thinking" there is nothing ambiguous left to debate, so execution proceeds directly through deterministic checks.
+
+![Figure 4A: Dynamic Mode Routing Policy](figures/fig4A-dynamic-mode-routing-policy.png)
+
+*Figure 4A: Runtime policy for routing tasks into Simple, Complex, or Debate mode. Simple tasks get one expert and direct execution. Complex tasks get full DAG orchestration. Debate activates only when uncertainty justifies extra thinking, and can be skipped entirely when a detailed spec already provides clear constraints.*
 
 ###### The Bigger Picture: Combining Patterns on a Task DAG
 
 ![Figure 5: Combined Patterns on a Task DAG](figures/fig05-combined-patterns-dag.png)
 
-*Figure 5: The bigger picture. A single task DAG uses Sequential for dependent subtasks, Parallel for independent checks, and Debate for high-risk decisions. The orchestrator picks the right pattern for each section of the DAG, not one pattern for the whole task. If confidence is low after Debate, HITLGovernor takes over.*
+*Figure 5: The bigger picture. A single task DAG uses Sequential for dependent subtasks, Parallel for independent multimodal work (image, video, audio running simultaneously), and Debate for high-risk decisions. The orchestrator picks the right pattern for each section of the DAG, not one pattern for the whole task. If confidence is low after Debate, HITLGovernor takes over.*
 
 This is the core architecture of the coordination engine. The orchestrator reads the task DAG (produced by TaskAnalyzer in Phase 1), looks at each section, and decides:
 
 - **Sequential** when subtasks depend on each other. You cannot write tests before the patch exists.
-- **Parallel** when subtasks are independent. Lint checks, unit tests, and doc checks can all run at the same time.
+- **Parallel** when subtasks are independent. Image analysis, video analysis, and audio analysis can all run at the same time because they do not depend on each other's output.
 - **Debate** when the decision is high-impact or uncertain, and two different expert perspectives can catch different failure modes. This is where the real value of multi-expert swarms shows up.
 
 Notice how Figure 5 connects back to Figure 3. The TaskAnalyzer produces the DAG, SwarmComposer assigns expert models and pattern hints, and then the coordination engine executes the plan using the right pattern for each section.
+
+###### Council-Style Debate Design
+
+The Debate pattern is implemented as a council-style mechanism inspired by modern multi-model systems. Think of it like the council mode in advanced AI platforms where multiple top-tier models (like GPT, Claude, and Gemini) are sent the same prompt simultaneously, each bringing its own strengths and blind spots. The system deliberately creates useful disagreement:
+
+1. **Parallel proposal generation** from diverse expert models. Each model is selected specifically because it has different strengths, ensuring a wide range of perspectives.
+2. **Optional cross-examination** where experts critique each other's reasoning to find flaws or missing data points.
+3. **Judge synthesis** using hard checks and evidence scoring, not rhetorical confidence. The judge does not pick whichever answer sounds best. It runs constraint checks and evaluates evidence.
+4. **Confidence gate** deciding accept, revise, or escalate to HITL.
+
+You can think of Debate as "extra thinking." It is not a default step for every request. It is activated when uncertainty and impact justify the overhead of running multiple expert models in parallel.
+
+![Figure 5A: Council-Style Debate Pipeline](figures/fig5A-council-debate-pipeline.png)
+
+*Figure 5A: Council-style debate as structured extra thinking. Multiple expert models reason in parallel (each selected for different strengths), optionally cross-examine each other, then a judge synthesizes using evidence and constraints, not rhetorical confidence. If confidence is high, the plan executes. If not, it escalates to a human.*
 
 ###### Why Debate Adds Value (and how we will prove it)
 
@@ -132,7 +160,6 @@ Each test below maps to the "Security Expert, Performance Expert, Judge" flow fr
 
 **Test 1: `debate_selects_patch_that_passes_unit_tests`**
 
-
 ![Figure 6: Debate Test 1](figures/fig06-debate-test1-patch-selection.png)
 
 *Figure 6: Debate Test 1. Agent A proposes a correct but slower fix. Agent B proposes a fast but broken fix. The Judge runs the test suite and selects Patch A because it passes all tests. The audit trail records the rationale.*
@@ -151,6 +178,7 @@ Expected:
 
 **Test 2: `debate_resolves_safety_vs_performance_tradeoff`**
 
+
 ![Figure 7: Debate Test 2](figures/fig07-debate-test2-constraint-resolution.png)
 
 *Figure 7: Debate Test 2. Agent A respects the rate limit. Agent B violates it. The Judge checks both hard constraints and selects Agent A. If neither had passed, the system escalates to HITLGovernor instead of silently picking a risky option.*
@@ -163,7 +191,7 @@ Setup:
 
 Expected:
 - Judge selects Agent A because it satisfies all hard constraints.
-- If neither proposal satisfies all constraints, Judge triggers escalation to HITLGovernor (Figure 9), because we should not silently pick a risky option.
+- If neither proposal satisfies all constraints, Judge triggers escalation to HITLGovernor (Figure 10), because we should not silently pick a risky option.
 
 ---
 
@@ -222,6 +250,7 @@ If Debate improves success rate without unacceptable overhead, we have a defensi
 - Implement `HITLGovernor` following the five-phase secretary model from the idea text, with clear state transitions for Receive, Clarify, Schedule, Monitor, and Report.
 - Connect coordination patterns with HITL, so patterns know when a decision needs human approval, and HITLGovernor knows what context to assemble and how to pause and resume execution. This includes the escalation path from Debate (Test 3, Figure 8) and the action safety path (covered in detail after Figure 15).
 
+
 ![Figure 10: HITLGovernor State Machine](figures/fig10-hitl-governor-state-machine.png)
 
 *Figure 10: The five-phase lifecycle of HITLGovernor. Notice the two entry points: one from Debate (when evidence is weak, as in Test 3 / Figure 8) and one from Action Safety (when a risky action is detected, covered in Figure 15). Tasks can loop back to Clarify if more info is needed, or escalate if the SLA timeout is hit.*
@@ -259,7 +288,7 @@ What I plan to do:
 
 - Implement the core governance objects and make sure they capture all the decision points from Figures 4, 5, 6, 7, 8, and 10, including Debate outcomes, HITL approvals, and action safety decisions.
 - Implement multi-channel notification adapters. At first, the focus is on defining the interface and providing one or two simple adapters (webhook and console/log) that others can extend.
-- Integrate with MoFA Gateway by using capability APIs instead of hardcoding protocol details inside orchestrator components.
+- Integrate with MoFA Gateway by using capability APIs instead of hardcoding protocol details inside orchestrator components. The proposal treats Gateway as a major platform capability and aligns with its current larger scope in `mofa-main`.
 - Integrate with MoFA Smith or Observatory by emitting the structured AuditEvent and DecisionRecord data as traces and metrics for swarm runs.
 
 ---
@@ -301,6 +330,25 @@ What I plan to do:
 
 Given the time available, this phase will prioritize a correct and extensible core over a feature-complete marketplace.
 
+###### Semantic Agent Generation: What If the Agent Does Not Exist Yet?
+
+Some agents will be hardcoded and pre-written standard experts that cover common tasks like code generation, testing, and security review. But what happens when the orchestrator needs a specialist for a specific subtask and no suitable prebuilt agent exists in the registry?
+
+Instead of failing or falling back to a generic model, the system can generate a scaffolded specialist agent on the fly. This is Semantic Agent Generation , the complement to Semantic Agent Discovery. Discovery is always first. Generation is the controlled fallback.
+
+The flow works like this:
+
+- Try semantic discovery first against registered capabilities.
+- If no candidate meets the quality threshold, generate a scaffolded specialist agent template tailored to the subtask requirements.
+- Run validation checks for interface compatibility, policy safety, and baseline task quality before the generated agent is allowed to participate.
+- Register the generated agent with explicit trust flags (like `generated=true`, `validation_passed=true`) so it is transparent and auditable. It does not silently blend in with pre-written agents.
+
+This keeps orchestration robust even when the registry is incomplete, while maintaining full transparency about what is pre-built and what was generated.
+
+![Figure 12A: Semantic Discovery to Agent Generation Fallback](figures/fig12A-discovery-generation-fallback.png)
+
+*Figure 12A: Discovery-first orchestration with controlled generation fallback. When no suitable prebuilt agent exists in the registry, the system generates a scaffolded specialist, validates it against interface, safety, and quality checks, then registers it with explicit trust flags before allowing it to participate. The audit trail always records whether an agent was pre-built or generated.*
+
 ---
 
 ### End-to-End Orchestration Flow
@@ -309,7 +357,7 @@ To tie all the phases together, here is how a complete task flows through the sy
 
 ![Figure 13: End-to-End Orchestration Flow](figures/fig13-end-to-end-flow.png)
 
-*Figure 13: The full lifecycle of a task, from submission through decomposition, expert matching, action safety check, optional human approval, coordinated execution with combined patterns, and result delivery. Each step references the figure where that component is described in detail.*
+*Figure 13: The full lifecycle of a task, from submission through decomposition, expert matching (with generation fallback), action safety check, optional human approval, coordinated execution with combined patterns, and result delivery. Each step references the figure where that component is described in detail.*
 
 ---
 
@@ -329,11 +377,13 @@ On Linux and Unix systems, every file and directory has permissions that control
 
 The orchestrator needs to understand these distinctions to make good decisions about when to ask for human approval.
 
+
 ![Figure 14: Linux Permission Risk Zones](figures/fig14-linux-permission-risk-zones.png)
 
 *Figure 14: Where actions happen on the filesystem determines their risk level. System paths like /etc and /usr/bin always require human approval. Workspace paths are usually safe. Users can add custom rules for paths like production/.*
 
 #### The Action Safety Classification Policy
+
 
 ![Figure 15: Action Safety Decision Tree](figures/fig15-action-safety-classification.png)
 
@@ -391,7 +441,6 @@ Expected:
 
 **Test 6: `require_approval_for_delete`**
 
-
 ![Figure 18: Action Safety Test 6](figures/fig18-action-test6-delete-approval.png)
 
 *Figure 18: Test 6. Deleting a data directory is destructive. The system pauses, sends context to a human, and waits for a decision before proceeding.*
@@ -441,7 +490,6 @@ Expected:
 ---
 
 **Test 9: `user_configured_rule_overrides_default`**
-
 
 ![Figure 21: Action Safety Test 9](figures/fig21-action-test9-user-rule-override.png)
 
